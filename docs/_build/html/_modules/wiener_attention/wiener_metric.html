@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+
+<html lang="en" data-content_root="../../">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>wiener_attention.wiener_metric &#8212; Wiener Transformer 1.0 documentation</title>
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=d1102ebc" />
+    <link rel="stylesheet" type="text/css" href="../../_static/basic.css?v=c058f7c8" />
+    <link rel="stylesheet" type="text/css" href="../../_static/alabaster.css?v=27fed22d" />
+    <script src="../../_static/documentation_options.js?v=f2a433a1"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+   
+  <link rel="stylesheet" href="../../_static/custom.css" type="text/css" />
+  
+
+  
+  
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <h1>Source code for wiener_attention.wiener_metric</h1><div class="highlight"><pre>
+<span></span><span class="kn">import</span> <span class="nn">torch</span>
+<span class="kn">import</span> <span class="nn">torch.nn</span> <span class="k">as</span> <span class="nn">nn</span>
+<span class="kn">from</span> <span class="nn">torch.distributions.multivariate_normal</span> <span class="kn">import</span> <span class="n">MultivariateNormal</span>
+<span class="kn">from</span> <span class="nn">math</span> <span class="kn">import</span> <span class="n">floor</span>
+
+
+<div class="viewcode-block" id="WienerSimilarityMetric">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric">[docs]</a>
+<span class="k">class</span> <span class="nc">WienerSimilarityMetric</span><span class="p">(</span><span class="n">nn</span><span class="o">.</span><span class="n">Module</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    This loss was implemented by Cruz et al  in the paper `Convolve and Conquer:</span>
+<span class="sd">    Data Comparison with Wiener Filters`. I have modified the implementation in two</span>
+<span class="sd">    ways:</span>
+
+<span class="sd">    1. Ensured that the identity function can work with any number of dimensions</span>
+<span class="sd">    </span>
+<span class="sd">    2. Made the function not return an average, but rather a value for each sample</span>
+<span class="sd">    pair in the batch.</span>
+
+<span class="sd">    Original implementation: https://github.com/dpelacani/WienerLoss</span>
+<span class="sd">    </span>
+<span class="sd">    The AWLoss class implements the adaptive Wiener criterion, which</span>
+<span class="sd">    aims to compare two data samples through a convolutional filter. The</span>
+<span class="sd">    methodology is inspired by the paper `Adaptive Waveform Inversion:</span>
+<span class="sd">    Theory`_ (Warner and Guasch, 2014).</span>
+
+<span class="sd">    A matching filter `w` can be computed such that it transforms</span>
+<span class="sd">    a targetsignal `p` into the data `d` under an L2 norm principle:</span>
+
+<span class="sd">    g = || p*w - d ||^2</span>
+
+<span class="sd">    Let &#39;Z&#39; be the Toeplitz matrix formulation of `p` such that the</span>
+<span class="sd">    equation above is equivalent to:</span>
+<span class="sd">    g = || Zw - d ||^2</span>
+
+<span class="sd">    Minimizing this functional:</span>
+<span class="sd">    dgdw = Z^T (Zw - d)</span>
+<span class="sd">    dgdw --&gt; 0 : w = (Z^T @ Z)^(-1) @ Z^T @ d</span>
+
+<span class="sd">    To stabilize the matrix inversion, an amount is added to the diagonal</span>
+<span class="sd">    of (Z^T @ Z) based on a value epsilon such that the inverted matrix is</span>
+<span class="sd">    (Z^T @ Z) + max(diagonal(Z^T @ Z)) * epsilon</span>
+
+
+<span class="sd">    In 2D, convolving p with w (or w with p) is equivalent to the matrix</span>
+<span class="sd">    vector multiplication Zd where Z is the doubly block Toeplitz of the</span>
+<span class="sd">    reconstructed image P and w is the flattened array of the 2D kernel W.</span>
+
+<span class="sd">    Therefore, the system is equivalent to solving || Zw - d ||^2, and</span>
+<span class="sd">    the solution to w is given by</span>
+<span class="sd">    w = (Z^T @ Z + max(diagonal(Z^T @ Z)) * epsilon)^(-1) @ Z^T @ d</span>
+
+<span class="sd">    This composes the direct method.</span>
+
+<span class="sd">    Alternatively, convolution can be performed in the frequency domain</span>
+<span class="sd">    with multiplication and division operations.</span>
+<span class="sd">    This tends to be much more computationally efficient.</span>
+
+<span class="sd">    The criterion is evaluated through a symmetrical monotonically decreasing</span>
+<span class="sd">    function T and a dirac delta function that rewards when the filter kernel</span>
+<span class="sd">    `w` is close to the identity kernel, and penalizes otherwise.</span>
+
+<span class="sd">    f = 1/2 ||T * (v - delta)||^2</span>
+
+<span class="sd">    Args:</span>
+<span class="sd">        method, optional</span>
+<span class="sd">            &quot;fft&quot; for Fast Fourier Transform or &quot;direct&quot; for the</span>
+<span class="sd">            Levinson-Durbin recurssion algorithm. Defaults to &quot;fft&quot;</span>
+<span class="sd">        filter_dim, optional</span>
+<span class="sd">            the dimensionality of the filter. This parameter should be</span>
+<span class="sd">            upper-bounded by the dimensionality of the data. If data is</span>
+<span class="sd">            3-dimensional and filter_dim is set to 2, one filter is computed</span>
+<span class="sd">            per channel dimension assuming format [B, NC, H , W]. Current</span>
+<span class="sd">            implementation only supports filter dimensions for 1D, 2D and 3D.</span>
+<span class="sd">            Defaults to 2</span>
+<span class="sd">        filter_scale, optional</span>
+<span class="sd">            the scale of the filters compared to the size of the data.</span>
+<span class="sd">            Defaults to 2</span>
+<span class="sd">        reduction, optional</span>
+<span class="sd">            specifies the reduction to apply to the output, &quot;mean&quot; or &quot;sum&quot;.</span>
+<span class="sd">            Defaults to mean</span>
+<span class="sd">        mode, optional</span>
+<span class="sd">            &quot;forward&quot; or &quot;reverse&quot; computation of the filter. For details of</span>
+<span class="sd">            the difference, refer to the original paper. Default &quot;reverse&quot;</span>
+<span class="sd">        penalty_function, optional</span>
+<span class="sd">            the penalty function to apply to the filter. If None, the penalty</span>
+<span class="sd">            function is the identity. Takes &quot;identity&quot;, &quot;gaussian&quot; or custom</span>
+<span class="sd">            penalty function. Default None</span>
+<span class="sd">        std, optional</span>
+<span class="sd">            the standard deviation of the gaussian when penalty_function=&quot;gaussian&quot;.</span>
+<span class="sd">            Mean is always zero. Default None</span>
+<span class="sd">        store_filters, optional</span>
+<span class="sd">            whether to store the filters in memory, useful for debugging.</span>
+<span class="sd">            Option to store the filers before or after normalisation with</span>
+<span class="sd">            &quot;norm&quot; and &quot;unorm&quot;. Default False.</span>
+<span class="sd">        epsilon, optional</span>
+<span class="sd">            the stabilization value to compute the filter. Default 1e-4.</span>
+<span class="sd">        clamp_min, optional</span>
+<span class="sd">            filters are clipped to this minimum value after computation. If</span>
+<span class="sd">            None, operation is disabled. Default none</span>
+
+<span class="sd">    .. _Convolve and Conquer \: Data Comparison with Wiener Filters:</span>
+<span class="sd">        https://arxiv.org/pdf/2311.06558</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+    <span class="k">def</span> <span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">method</span><span class="o">=</span><span class="s2">&quot;fft&quot;</span><span class="p">,</span> <span class="n">filter_dim</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">filter_scale</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span>
+                 <span class="n">reduction</span><span class="o">=</span><span class="s2">&quot;mean&quot;</span><span class="p">,</span> <span class="n">mode</span><span class="o">=</span><span class="s2">&quot;reverse&quot;</span><span class="p">,</span> <span class="n">penalty_function</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">store_filters</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">epsilon</span><span class="o">=</span><span class="mf">1e-4</span><span class="p">,</span>  <span class="n">std</span><span class="o">=</span><span class="mf">1e-4</span><span class="p">,</span> <span class="n">clamp_min</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                 <span class="n">corr_norm</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">rel_epsilon</span><span class="o">=</span><span class="kc">False</span><span class="p">):</span>
+
+        <span class="nb">super</span><span class="p">(</span><span class="n">WienerSimilarityMetric</span><span class="p">,</span> <span class="bp">self</span><span class="p">)</span><span class="o">.</span><span class="fm">__init__</span><span class="p">()</span>
+
+        <span class="c1"># Store arguments</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">epsilon</span> <span class="o">=</span> <span class="n">epsilon</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">std</span> <span class="o">=</span> <span class="n">std</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">filter_scale</span> <span class="o">=</span> <span class="n">filter_scale</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">penalty_function</span> <span class="o">=</span> <span class="n">penalty_function</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">mode</span> <span class="o">=</span> <span class="n">mode</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">clamp_min</span> <span class="o">=</span> <span class="n">clamp_min</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">rel_epsilon</span><span class="o">=</span><span class="n">rel_epsilon</span>
+
+        <span class="c1"># Check arguments</span>
+        <span class="k">if</span> <span class="n">store_filters</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;norm&quot;</span><span class="p">,</span> <span class="s2">&quot;unorm&quot;</span><span class="p">]</span> <span class="ow">or</span> <span class="n">store_filters</span> <span class="ow">is</span> <span class="kc">False</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">store_filters</span> <span class="o">=</span> <span class="n">store_filters</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;store_filters must be &#39;norm&#39;, &#39;unorm&#39; or&quot;</span>
+                             <span class="s2">&quot;False, but found </span><span class="si">{}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">store_filters</span><span class="p">))</span>
+
+        <span class="k">if</span> <span class="n">reduction</span> <span class="o">==</span> <span class="s2">&quot;mean&quot;</span> <span class="ow">or</span> <span class="n">reduction</span> <span class="o">==</span> <span class="s2">&quot;sum&quot;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">reduction</span> <span class="o">=</span> <span class="n">reduction</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;reduction must be &#39;mean&#39; or &quot;</span>
+                             <span class="s2">&quot;&#39;sum&#39; but found </span><span class="si">{}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">reduction</span><span class="p">))</span>
+
+        <span class="k">if</span> <span class="n">filter_dim</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">1</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">]:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span> <span class="o">=</span> <span class="n">filter_dim</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">dims</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">([</span><span class="o">-</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)])</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Filter dimensions must be 1, 2 or 3&quot;</span>
+                             <span class="s2">&quot;, but found </span><span class="si">{}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">filter_dim</span><span class="p">))</span>
+            
+        <span class="k">if</span> <span class="n">corr_norm</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">corr_norm</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span> <span class="ow">in</span> <span class="p">[</span><span class="s2">&quot;rms&quot;</span><span class="p">,</span> <span class="s2">&quot;minmax&quot;</span><span class="p">,</span> <span class="s2">&quot;ncc&quot;</span><span class="p">,</span> <span class="s2">&quot;zncc&quot;</span><span class="p">]:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">corr_norm</span> <span class="o">=</span> <span class="n">corr_norm</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
+        <span class="k">elif</span> <span class="n">corr_norm</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">corr_norm</span> <span class="o">=</span> <span class="n">corr_norm</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;Normalisation of cross correlation only&quot;</span>
+                             <span class="s2">&quot; supports &#39;rms&#39;, &#39;minmax&#39;, &#39;ncc&#39;, and &#39;zncc&#39; but found&quot;</span>
+                             <span class="s2">&quot; &#39;</span><span class="si">{}</span><span class="s2">&#39;&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">corr_norm</span><span class="p">))</span>
+
+        <span class="k">if</span> <span class="n">method</span> <span class="o">==</span> <span class="s2">&quot;fft&quot;</span> <span class="ow">or</span> <span class="n">method</span> <span class="o">==</span> <span class="s2">&quot;direct&quot;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">method</span> <span class="o">=</span> <span class="n">method</span>
+            <span class="k">if</span> <span class="n">method</span> <span class="o">==</span> <span class="s2">&quot;direct&quot;</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">filter_scale</span> <span class="o">=</span> <span class="mi">2</span>   <span class="c1"># Larger filter scales not supported</span>
+                <span class="c1"># for direct methods</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span> <span class="o">==</span> <span class="mi">3</span><span class="p">:</span>
+                    <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span><span class="s2">&quot;3D filter implementation&quot;</span>
+                                              <span class="s2">&quot;not available for the direct&quot;</span>
+                                              <span class="s2">&quot;method&quot;</span><span class="p">)</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;method must be &#39;fft&#39; or &#39;direct&#39;&quot;</span>
+                             <span class="s2">&quot;, but found </span><span class="si">{}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">method</span><span class="p">))</span>
+
+        <span class="c1"># Variables to store metadata</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">delta</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">filters</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">W</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">current_epoch</span> <span class="o">=</span> <span class="mi">0</span>
+
+<div class="viewcode-block" id="WienerSimilarityMetric.make_toeplitz">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.make_toeplitz">[docs]</a>
+    <span class="k">def</span> <span class="nf">make_toeplitz</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">a</span><span class="p">):</span>
+        <span class="s2">&quot;Makes toeplitz matrix of a vector A&quot;</span>
+        <span class="n">h</span> <span class="o">=</span> <span class="n">a</span><span class="o">.</span><span class="n">size</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span>
+        <span class="n">A</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">((</span><span class="mi">3</span><span class="o">*</span><span class="n">h</span><span class="o">-</span><span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="o">*</span><span class="n">h</span><span class="o">-</span><span class="mi">1</span><span class="p">),</span> <span class="n">device</span><span class="o">=</span><span class="n">a</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="o">*</span><span class="n">h</span><span class="o">-</span><span class="mi">1</span><span class="p">):</span>
+            <span class="n">A</span><span class="p">[</span><span class="n">i</span><span class="p">:</span><span class="n">i</span><span class="o">+</span><span class="n">h</span><span class="p">,</span> <span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">a</span><span class="p">[:]</span>
+        <span class="n">A</span> <span class="o">=</span> <span class="n">A</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">a</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">A</span></div>
+
+
+<div class="viewcode-block" id="WienerSimilarityMetric.make_doubly_block">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.make_doubly_block">[docs]</a>
+    <span class="k">def</span> <span class="nf">make_doubly_block</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">X</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Makes Doubly Blocked Toeplitz of a matrix X [r, c]&quot;&quot;&quot;</span>
+        <span class="c1"># each row will have a toeplitz</span>
+        <span class="c1"># matrix of rowsize 3*X.shape[1] - 2</span>
+        <span class="n">r_block</span> <span class="o">=</span> <span class="mi">3</span> <span class="o">*</span> <span class="n">X</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="mi">2</span>
+
+        <span class="c1"># each row will have a toeplitz</span>
+        <span class="c1"># matrix of colsize 2*X.shape[1] - 1</span>
+        <span class="n">c_block</span> <span class="o">=</span> <span class="mi">2</span><span class="o">*</span><span class="n">X</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span>
+
+        <span class="c1"># how many rows / number of blocks</span>
+        <span class="n">n_blocks</span> <span class="o">=</span> <span class="n">X</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+
+        <span class="c1"># total number of rows in doubly blocked toeplitz</span>
+        <span class="n">r</span> <span class="o">=</span> <span class="mi">3</span><span class="o">*</span><span class="p">(</span><span class="n">n_blocks</span> <span class="o">*</span> <span class="n">r_block</span><span class="p">)</span> <span class="o">-</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">r_block</span>
+
+        <span class="c1"># total number of cols in doubly blocked toeplitz</span>
+        <span class="n">c</span> <span class="o">=</span> <span class="mi">2</span><span class="o">*</span><span class="p">(</span><span class="n">n_blocks</span> <span class="o">*</span> <span class="n">c_block</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span> <span class="o">*</span> <span class="n">c_block</span>
+
+        <span class="n">Z</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">(</span><span class="n">r</span><span class="p">,</span> <span class="n">c</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">X</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">X</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]):</span>
+            <span class="n">row_toeplitz</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">make_toeplitz</span><span class="p">(</span><span class="n">X</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+            <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">2</span><span class="o">*</span><span class="n">n_blocks</span> <span class="o">-</span> <span class="mi">1</span><span class="p">):</span>
+                <span class="n">ridx</span> <span class="o">=</span> <span class="p">(</span><span class="n">i</span><span class="o">+</span><span class="n">j</span><span class="p">)</span><span class="o">*</span><span class="n">r_block</span>
+                <span class="n">cidx</span> <span class="o">=</span> <span class="n">j</span><span class="o">*</span><span class="n">c_block</span>
+                <span class="n">Z</span><span class="p">[</span><span class="n">ridx</span><span class="p">:</span><span class="n">ridx</span><span class="o">+</span><span class="n">r_block</span><span class="p">,</span> <span class="n">cidx</span><span class="p">:</span><span class="n">cidx</span><span class="o">+</span><span class="n">c_block</span><span class="p">]</span> <span class="o">=</span> <span class="n">row_toeplitz</span><span class="p">[:,</span> <span class="p">:]</span>
+        <span class="k">return</span> <span class="n">Z</span></div>
+
+
+<div class="viewcode-block" id="WienerSimilarityMetric.get_filter_shape">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.get_filter_shape">[docs]</a>
+    <span class="k">def</span> <span class="nf">get_filter_shape</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">input_shape</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">_</span><span class="p">,</span> <span class="n">n</span> <span class="o">=</span> <span class="n">input_shape</span>
+            <span class="n">fs</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">filter_scale</span><span class="o">*</span><span class="n">n</span><span class="p">]</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span> <span class="o">==</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="n">_</span><span class="p">,</span> <span class="n">nc</span><span class="p">,</span> <span class="n">h</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">input_shape</span>
+            <span class="n">fs</span> <span class="o">=</span> <span class="p">[</span><span class="n">nc</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">filter_scale</span><span class="o">*</span><span class="n">h</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">filter_scale</span><span class="o">*</span><span class="n">w</span><span class="p">]</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span> <span class="o">==</span> <span class="mi">3</span><span class="p">:</span>
+            <span class="n">_</span><span class="p">,</span> <span class="n">nc</span><span class="p">,</span> <span class="n">h</span><span class="p">,</span> <span class="n">w</span> <span class="o">=</span> <span class="n">input_shape</span>
+            <span class="n">fs</span> <span class="o">=</span> <span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">filter_scale</span><span class="o">*</span><span class="n">nc</span><span class="p">,</span>
+                  <span class="bp">self</span><span class="o">.</span><span class="n">filter_scale</span><span class="o">*</span><span class="n">h</span><span class="p">,</span>
+                  <span class="bp">self</span><span class="o">.</span><span class="n">filter_scale</span><span class="o">*</span><span class="n">w</span><span class="p">]</span>
+
+        <span class="c1"># Make filter dimensions odd integers to allow spike at zero lag</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">fs</span><span class="p">)):</span>
+            <span class="n">fs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="nb">int</span><span class="p">(</span><span class="n">fs</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+            <span class="k">if</span> <span class="n">fs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">%</span> <span class="mi">2</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="c1"># Except nchannels for 2D filters, dimension</span>
+                <span class="c1"># must match to input</span>
+                <span class="k">if</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span> <span class="o">==</span> <span class="mi">2</span> <span class="ow">and</span> <span class="n">i</span> <span class="o">==</span> <span class="mi">0</span><span class="p">):</span>
+                    <span class="k">pass</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="n">fs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">fs</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">-</span> <span class="mi">1</span>
+        <span class="k">return</span> <span class="n">fs</span></div>
+
+
+<div class="viewcode-block" id="WienerSimilarityMetric.pad_signal">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.pad_signal">[docs]</a>
+    <span class="k">def</span> <span class="nf">pad_signal</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="n">val</span><span class="o">=</span><span class="mi">0</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        x must be a multichannel signal of shape</span>
+<span class="sd">        [batch_size, nchannels, width, height]</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">:])</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="n">shape</span><span class="p">),</span> <span class="s2">&quot;</span><span class="si">{}</span><span class="s2"> </span><span class="si">{}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">shape</span><span class="p">)</span>
+        <span class="n">pad</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">:])):</span>
+            <span class="n">p1</span> <span class="o">=</span> <span class="n">floor</span><span class="p">((</span><span class="n">shape</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">-</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="p">])</span><span class="o">/</span><span class="mi">2</span><span class="p">)</span>
+            <span class="n">p2</span> <span class="o">=</span> <span class="n">shape</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">-</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="n">i</span><span class="o">+</span><span class="mi">1</span><span class="p">]</span> <span class="o">-</span> <span class="n">p1</span>
+            <span class="n">pad</span><span class="o">.</span><span class="n">extend</span><span class="p">((</span><span class="n">p1</span><span class="p">,</span> <span class="n">p2</span><span class="p">))</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="c1"># permutation of list to agree with nn.functional.pad</span>
+            <span class="n">pad</span> <span class="o">=</span> <span class="p">[</span><span class="n">pad</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">5</span><span class="p">,</span> <span class="mi">0</span><span class="p">,</span> <span class="mi">1</span><span class="p">]]</span>
+        <span class="k">except</span><span class="p">:</span>
+            <span class="k">pass</span>
+        <span class="k">return</span> <span class="n">nn</span><span class="o">.</span><span class="n">functional</span><span class="o">.</span><span class="n">pad</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="nb">tuple</span><span class="p">(</span><span class="n">pad</span><span class="p">),</span> <span class="n">value</span><span class="o">=</span><span class="n">val</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="WienerSimilarityMetric.multigauss">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.multigauss">[docs]</a>
+    <span class="k">def</span> <span class="nf">multigauss</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mesh</span><span class="p">,</span> <span class="n">mean</span><span class="p">,</span> <span class="n">covmatrix</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        Multivariate gaussian of N dimensions on evenly spaced</span>
+<span class="sd">        hypercubed grid. Mesh should be stacked along the last axis</span>
+<span class="sd">        E.g. for a 3D gaussian of 20 grid points in each axis mesh</span>
+<span class="sd">        should be of shape (20, 20, 20, 3)</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">covmatrix</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span> <span class="o">==</span> <span class="mi">2</span>
+        <span class="k">assert</span> <span class="n">covmatrix</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="n">covmatrix</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+        <span class="k">assert</span> <span class="n">covmatrix</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="n">mean</span><span class="p">)</span>
+        <span class="k">assert</span> <span class="nb">len</span><span class="p">(</span><span class="n">mesh</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span> <span class="o">==</span> <span class="nb">len</span><span class="p">(</span><span class="n">mean</span><span class="p">)</span> <span class="o">+</span> <span class="mi">1</span><span class="p">,</span> \
+               <span class="s2">&quot;</span><span class="si">{}</span><span class="s2"> </span><span class="si">{}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">mesh</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span> <span class="nb">len</span><span class="p">(</span><span class="n">mean</span><span class="p">))</span>
+               
+        <span class="n">rv</span> <span class="o">=</span> <span class="n">MultivariateNormal</span><span class="p">(</span><span class="n">mean</span><span class="p">,</span> <span class="n">covmatrix</span><span class="p">)</span>
+        <span class="n">rv</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">exp</span><span class="p">(</span><span class="n">rv</span><span class="o">.</span><span class="n">log_prob</span><span class="p">(</span><span class="n">mesh</span><span class="p">))</span>
+        <span class="n">rv</span> <span class="o">=</span> <span class="n">rv</span> <span class="o">/</span> <span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">rv</span><span class="p">)</span><span class="o">.</span><span class="n">max</span><span class="p">()</span>
+        <span class="k">return</span> <span class="n">rv</span></div>
+
+    
+<div class="viewcode-block" id="WienerSimilarityMetric.identity">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.identity">[docs]</a>
+    <span class="k">def</span> <span class="nf">identity</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">mesh</span><span class="p">,</span> <span class="n">val</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span> <span class="o">**</span><span class="n">kwargs</span><span class="p">):</span>
+        <span class="n">T</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">mesh</span><span class="p">[</span><span class="o">...</span><span class="p">,</span> <span class="mi">0</span><span class="p">])</span> <span class="o">+</span> <span class="n">val</span>
+        <span class="k">return</span> <span class="n">T</span></div>
+
+
+<div class="viewcode-block" id="WienerSimilarityMetric.make_penalty">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.make_penalty">[docs]</a>
+    <span class="k">def</span> <span class="nf">make_penalty</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">,</span> <span class="n">eta</span><span class="o">=</span><span class="mf">0.</span><span class="p">,</span> <span class="n">penalty_function</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">std</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cpu&quot;</span><span class="p">):</span>
+        <span class="n">arr</span> <span class="o">=</span> <span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">linspace</span><span class="p">(</span><span class="o">-</span><span class="mf">1.</span><span class="p">,</span> <span class="mf">1.</span><span class="p">,</span> <span class="n">n</span><span class="p">,</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+               <span class="k">for</span> <span class="n">n</span> <span class="ow">in</span> <span class="n">shape</span><span class="p">]</span>
+        <span class="n">mesh</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">meshgrid</span><span class="p">(</span><span class="n">arr</span><span class="p">,</span> <span class="n">indexing</span><span class="o">=</span><span class="s2">&quot;ij&quot;</span><span class="p">)</span>
+        <span class="n">mesh</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">stack</span><span class="p">(</span><span class="n">mesh</span><span class="p">,</span> <span class="n">axis</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">penalty_function</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">penalty_function</span> <span class="o">==</span> <span class="s2">&quot;identity&quot;</span><span class="p">:</span>
+            <span class="n">penalty</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">identity</span><span class="p">(</span><span class="n">mesh</span><span class="p">)</span>
+            
+        <span class="k">elif</span> <span class="n">penalty_function</span> <span class="o">==</span> <span class="s2">&quot;gaussian&quot;</span><span class="p">:</span>
+            <span class="n">std</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">std</span> <span class="k">if</span> <span class="n">std</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">std</span>
+            <span class="n">mean</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mf">0.</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">mesh</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])],</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+            <span class="n">covmatrix</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">diag</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">(</span>
+                <span class="p">[</span><span class="n">std</span><span class="o">**</span><span class="mi">2</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">mesh</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="o">-</span><span class="mi">1</span><span class="p">])],</span> <span class="n">requires_grad</span><span class="o">=</span><span class="kc">True</span><span class="p">))</span>
+            <span class="n">penalty</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">multigauss</span><span class="p">(</span><span class="n">mesh</span><span class="p">,</span> <span class="n">mean</span><span class="p">,</span> <span class="n">covmatrix</span><span class="p">)</span>
+
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">penalty</span> <span class="o">=</span> <span class="n">penalty_function</span><span class="p">(</span><span class="n">mesh</span><span class="p">)</span>
+        
+        <span class="n">penalty</span> <span class="o">=</span> <span class="n">penalty</span> <span class="o">+</span> <span class="n">eta</span><span class="o">*</span><span class="n">torch</span><span class="o">.</span><span class="n">rand_like</span><span class="p">(</span><span class="n">penalty</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">penalty</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">device</span><span class="p">)</span></div>
+
+    
+<div class="viewcode-block" id="WienerSimilarityMetric.make_delta">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.make_delta">[docs]</a>
+    <span class="k">def</span> <span class="nf">make_delta</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shape</span><span class="p">):</span>
+        <span class="n">delta</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">(</span><span class="n">shape</span><span class="p">)</span>
+        <span class="n">torch</span><span class="o">.</span><span class="n">nn</span><span class="o">.</span><span class="n">init</span><span class="o">.</span><span class="n">dirac_</span><span class="p">(</span><span class="n">delta</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">delta</span></div>
+
+
+
+<div class="viewcode-block" id="WienerSimilarityMetric.rms">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.rms">[docs]</a>
+    <span class="k">def</span> <span class="nf">rms</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">):</span>
+        <span class="n">square</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">pow</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
+        <span class="n">mean_square</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">mean</span><span class="p">(</span><span class="n">square</span><span class="p">)</span><span class="c1">#, dim=self.dims)</span>
+        <span class="n">rms</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">mean_square</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">rms</span><span class="o">.</span><span class="n">item</span><span class="p">()</span></div>
+
+
+<div class="viewcode-block" id="WienerSimilarityMetric.wienerfft">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.wienerfft">[docs]</a>
+    <span class="k">def</span> <span class="nf">wienerfft</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">fs</span><span class="p">,</span> <span class="n">prwh</span><span class="o">=</span><span class="mf">1e-9</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        George Strong (geowstrong@gmail.com)</span>
+<span class="sd">        calculates the optimal least squares convolutional Wiener filter that</span>
+<span class="sd">        transforms signal x into signal y using FFT</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">assert</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">y</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="s2">&quot;signals x and y must be the same shape&quot;</span>
+        
+        <span class="c1"># Cross-correlation of x with y</span>
+        <span class="n">Fccorr</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">fft</span><span class="o">.</span><span class="n">fftn</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dims</span><span class="p">)</span>\
+            <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">conj</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">fft</span><span class="o">.</span><span class="n">fftn</span><span class="p">(</span><span class="n">y</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dims</span><span class="p">))</span>
+
+        <span class="c1"># Auto-correlation of x</span>
+        <span class="n">Facorr</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">fft</span><span class="o">.</span><span class="n">fftn</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dims</span><span class="p">)</span>\
+            <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">conj</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">fft</span><span class="o">.</span><span class="n">fftn</span><span class="p">(</span><span class="n">x</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dims</span><span class="p">))</span>
+            
+        <span class="c1"># Normalise correlations</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">corr_norm</span> <span class="o">==</span> <span class="s2">&quot;rms&quot;</span><span class="p">:</span>
+            <span class="n">rms</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">rms</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">Fccorr</span><span class="p">))</span>
+            <span class="n">Fccorr</span> <span class="o">=</span> <span class="n">Fccorr</span> <span class="o">/</span> <span class="n">rms</span>
+            <span class="n">Facorr</span> <span class="o">=</span> <span class="n">Facorr</span> <span class="o">/</span> <span class="n">rms</span>
+            
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">corr_norm</span> <span class="o">==</span> <span class="s2">&quot;ncc&quot;</span><span class="p">:</span>
+            <span class="n">Fccorr</span> <span class="o">=</span> <span class="n">Fccorr</span> <span class="o">/</span> <span class="n">Fccorr</span><span class="o">.</span><span class="n">std</span><span class="p">()</span>
+            <span class="n">Facorr</span> <span class="o">=</span> <span class="n">Facorr</span> <span class="o">/</span> <span class="n">Facorr</span><span class="o">.</span><span class="n">std</span><span class="p">()</span>
+        
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">corr_norm</span> <span class="o">==</span> <span class="s2">&quot;minmax&quot;</span><span class="p">:</span>
+            <span class="n">Fccorr</span> <span class="o">=</span> <span class="n">Fccorr</span> <span class="o">/</span> <span class="n">torch</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">Fccorr</span><span class="p">))</span>
+            <span class="n">Facorr</span> <span class="o">=</span> <span class="n">Facorr</span> <span class="o">/</span> <span class="n">torch</span><span class="o">.</span><span class="n">max</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">Facorr</span><span class="p">))</span>
+            
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">corr_norm</span> <span class="o">==</span> <span class="s2">&quot;zncc&quot;</span><span class="p">:</span>
+            <span class="n">Fccorr</span> <span class="o">=</span> <span class="p">(</span><span class="n">Fccorr</span> <span class="o">-</span> <span class="n">Fccorr</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span> <span class="o">/</span> <span class="n">Fccorr</span><span class="o">.</span><span class="n">std</span><span class="p">()</span>
+            <span class="n">Facorr</span> <span class="o">=</span> <span class="p">(</span><span class="n">Facorr</span> <span class="o">-</span> <span class="n">Facorr</span><span class="o">.</span><span class="n">mean</span><span class="p">())</span> <span class="o">/</span> <span class="n">Facorr</span><span class="o">.</span><span class="n">std</span><span class="p">()</span>
+
+        <span class="c1"># Deconvolution of Fccorr by Facorr with (relative) pre-whitening</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">rel_epsilon</span><span class="p">:</span>
+            <span class="n">prwh</span> <span class="o">=</span> <span class="n">prwh</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">rms</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">Fccorr</span><span class="p">))</span> 
+        <span class="n">Fdconv</span> <span class="o">=</span> <span class="p">(</span><span class="n">Fccorr</span> <span class="o">+</span> <span class="n">prwh</span><span class="p">)</span> <span class="o">/</span> <span class="p">(</span><span class="n">Facorr</span> <span class="o">+</span> <span class="n">prwh</span><span class="p">)</span>
+
+        <span class="c1"># Inverse Fourier transform</span>
+        <span class="n">rolled</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">fft</span><span class="o">.</span><span class="n">irfftn</span><span class="p">(</span><span class="n">Fdconv</span><span class="p">,</span> <span class="n">fs</span><span class="p">[</span><span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span><span class="p">:],</span> <span class="n">dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dims</span><span class="p">)</span>
+
+        <span class="c1"># Unrolling</span>
+        <span class="n">rolling</span> <span class="o">=</span> <span class="nb">tuple</span><span class="p">([</span><span class="nb">int</span><span class="p">(</span><span class="o">-</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">/</span><span class="mi">2</span><span class="p">)</span> <span class="o">-</span> <span class="mi">1</span>
+                        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">),</span> <span class="mi">1</span><span class="p">)])[</span><span class="o">-</span><span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">dims</span><span class="p">):]</span>
+        <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">roll</span><span class="p">(</span><span class="n">rolled</span><span class="p">,</span> <span class="n">rolling</span><span class="p">,</span> <span class="n">dims</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dims</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="WienerSimilarityMetric.wiener">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.wiener">[docs]</a>
+    <span class="k">def</span> <span class="nf">wiener</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">x</span><span class="p">,</span> <span class="n">y</span><span class="p">,</span> <span class="n">fs</span><span class="p">,</span> <span class="n">epsilon</span><span class="o">=</span><span class="mf">1e-9</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">        calculates the optimal least squares convolutional Wiener filter that</span>
+<span class="sd">        transforms signal x into signal y using the direct Toeplitz matrix</span>
+<span class="sd">        implementation</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">assert</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">y</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="s2">&quot;signals x and y must be the same shape&quot;</span>
+
+        <span class="n">bs</span> <span class="o">=</span> <span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">empty</span><span class="p">([</span><span class="n">bs</span><span class="p">]</span><span class="o">+</span><span class="n">fs</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">x</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]):</span>
+                <span class="c1"># Compute filter</span>
+                <span class="n">D</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">make_toeplitz</span><span class="p">(</span><span class="n">x</span><span class="p">[</span><span class="n">i</span><span class="p">])</span>
+                <span class="n">D_t</span> <span class="o">=</span> <span class="n">D</span><span class="o">.</span><span class="n">T</span>
+                <span class="n">tmp</span> <span class="o">=</span> <span class="n">D</span><span class="o">.</span><span class="n">T</span> <span class="o">@</span> <span class="n">D</span>
+
+                <span class="c1"># Stabilize diagonals</span>
+                <span class="n">tmp</span> <span class="o">=</span> <span class="n">tmp</span> <span class="o">+</span> <span class="n">torch</span><span class="o">.</span><span class="n">diag</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">diagonal</span><span class="p">(</span><span class="n">tmp</span><span class="p">))</span>
+                                       <span class="o">+</span> <span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">tmp</span><span class="p">)</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">*</span><span class="n">epsilon</span><span class="p">)</span>
+                <span class="n">tmp</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">inverse</span><span class="p">(</span><span class="n">tmp</span><span class="p">)</span>
+                <span class="n">v</span><span class="p">[</span><span class="n">i</span><span class="p">]</span> <span class="o">=</span> <span class="n">tmp</span> <span class="o">@</span> <span class="p">(</span><span class="n">D_t</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_signal</span><span class="p">(</span><span class="n">y</span><span class="p">[</span><span class="n">i</span><span class="p">]</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+                                                    <span class="p">[</span><span class="n">D_t</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]])[</span><span class="mi">0</span><span class="p">])</span>
+
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span> <span class="o">==</span> <span class="mi">2</span><span class="p">:</span>
+            <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">bs</span><span class="p">):</span>
+                <span class="k">for</span> <span class="n">j</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="n">x</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">1</span><span class="p">]):</span>
+                    <span class="c1"># Compute filter</span>
+                    <span class="n">Z</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">make_doubly_block</span><span class="p">(</span><span class="n">x</span><span class="p">[</span><span class="n">i</span><span class="p">][</span><span class="n">j</span><span class="p">])</span>
+                    <span class="n">Z_t</span> <span class="o">=</span> <span class="n">Z</span><span class="o">.</span><span class="n">T</span>
+                    <span class="n">tmp</span> <span class="o">=</span> <span class="n">Z_t</span> <span class="o">@</span> <span class="n">Z</span>
+
+                    <span class="c1"># Stabilize diagonals</span>
+                    <span class="n">tmp</span> <span class="o">=</span> <span class="n">tmp</span> <span class="o">+</span> <span class="n">torch</span><span class="o">.</span><span class="n">diag</span><span class="p">(</span><span class="n">torch</span><span class="o">.</span><span class="n">zeros_like</span><span class="p">(</span>
+                                           <span class="n">torch</span><span class="o">.</span><span class="n">diagonal</span><span class="p">(</span><span class="n">tmp</span><span class="p">))</span> <span class="o">+</span>
+                                           <span class="n">torch</span><span class="o">.</span><span class="n">abs</span><span class="p">(</span><span class="n">tmp</span><span class="p">)</span><span class="o">.</span><span class="n">max</span><span class="p">()</span><span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">epsilon</span><span class="p">)</span>
+
+                    <span class="n">tmp</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">inverse</span><span class="p">(</span><span class="n">tmp</span><span class="p">)</span>
+                    <span class="n">tmp</span> <span class="o">=</span> <span class="n">tmp</span> <span class="o">@</span> <span class="p">(</span><span class="n">Z_t</span> <span class="o">@</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_signal</span><span class="p">(</span><span class="n">y</span><span class="p">[</span><span class="n">i</span><span class="p">][</span><span class="n">j</span><span class="p">]</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span>
+                                                       <span class="p">(</span><span class="mi">3</span><span class="o">*</span><span class="n">y</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span> <span class="o">-</span> <span class="mi">2</span><span class="p">,</span>
+                                                       <span class="mi">3</span><span class="o">*</span><span class="n">y</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">3</span><span class="p">]</span> <span class="o">-</span> <span class="mi">2</span><span class="p">)</span>
+                                                       <span class="p">)</span><span class="o">.</span><span class="n">flatten</span><span class="p">(</span><span class="n">start_dim</span><span class="o">=</span><span class="mi">0</span><span class="p">))</span>
+                    <span class="n">v</span><span class="p">[</span><span class="n">i</span><span class="p">][</span><span class="n">j</span><span class="p">]</span> <span class="o">=</span> <span class="n">tmp</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="n">fs</span><span class="p">[</span><span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span><span class="p">:])</span>
+        <span class="k">return</span> <span class="n">v</span></div>
+
+
+<div class="viewcode-block" id="WienerSimilarityMetric.forward">
+<a class="viewcode-back" href="../../wiener_attention.html#wiener_attention.wiener_metric.WienerSimilarityMetric.forward">[docs]</a>
+    <span class="k">def</span> <span class="nf">forward</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">recon</span><span class="p">,</span> <span class="n">target</span><span class="p">,</span> <span class="n">epsilon</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">gamma</span><span class="o">=</span><span class="mf">0.</span><span class="p">,</span> <span class="n">eta</span><span class="o">=</span><span class="mf">0.</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&#39;&#39;&#39;&gt; The function takes in a reconstructed signal, a target signal,</span>
+<span class="sd">        and a few other parameters, and returns the loss</span>
+
+<span class="sd">        Args</span>
+<span class="sd">            recon</span>
+<span class="sd">                the reconstructed signal</span>
+<span class="sd">            target</span>
+<span class="sd">                the target signal</span>
+<span class="sd">            epsilon, optional</span>
+<span class="sd">                the stabilization value to compute the filter. If passed,</span>
+<span class="sd">                overwrites the class attribute of same name. Default None.</span>
+<span class="sd">            gamma, optional</span>
+<span class="sd">                noise to add to both target and reconstructed signals</span>
+<span class="sd">                for training stabilization. Default 0.</span>
+<span class="sd">            eta, optional</span>
+<span class="sd">                noise to add to penalty function. Default 0.</span>
+
+<span class="sd">        &#39;&#39;&#39;</span>
+
+        <span class="k">assert</span> <span class="n">recon</span><span class="o">.</span><span class="n">shape</span> <span class="o">==</span> <span class="n">target</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="s2">&quot;recon and target must be of the&quot;</span> \
+            <span class="s2">&quot;same shape but found </span><span class="si">{}</span><span class="s2"> and </span><span class="si">{}</span><span class="s2">&quot;</span><span class="o">.</span><span class="n">format</span><span class="p">(</span><span class="n">recon</span><span class="o">.</span><span class="n">shape</span><span class="p">,</span> <span class="n">target</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+
+        <span class="c1"># White noise to recon and target for stabilization</span>
+        <span class="n">recon</span> <span class="o">=</span> <span class="n">recon</span> <span class="o">+</span> <span class="n">gamma</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">rand_like</span><span class="p">(</span><span class="n">recon</span><span class="p">)</span>
+        <span class="n">target</span> <span class="o">=</span> <span class="n">target</span> <span class="o">+</span> <span class="n">gamma</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">rand_like</span><span class="p">(</span><span class="n">target</span><span class="p">)</span>
+
+        <span class="c1"># Batch size</span>
+        <span class="n">bs</span> <span class="o">=</span> <span class="n">recon</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+
+        <span class="c1"># Flatten recon and target for 1D filters</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="n">recon</span> <span class="o">=</span> <span class="n">recon</span><span class="o">.</span><span class="n">flatten</span><span class="p">(</span><span class="n">start_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+            <span class="n">target</span> <span class="o">=</span> <span class="n">target</span><span class="o">.</span><span class="n">flatten</span><span class="p">(</span><span class="n">start_dim</span><span class="o">=</span><span class="mi">1</span><span class="p">)</span>
+
+        <span class="c1"># Define size of the filter, reserve memory to store them if prompted</span>
+        <span class="n">fs</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">get_filter_shape</span><span class="p">(</span><span class="n">recon</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">store_filters</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">filters</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">zeros</span><span class="p">([</span><span class="n">bs</span><span class="p">]</span><span class="o">+</span><span class="n">fs</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">recon</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+
+        <span class="c1"># Compute wiener filter</span>
+        <span class="n">epsilon</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">epsilon</span> <span class="k">if</span> <span class="n">epsilon</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">epsilon</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">method</span> <span class="o">==</span> <span class="s2">&quot;fft&quot;</span><span class="p">:</span>
+            <span class="n">recon</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_signal</span><span class="p">(</span><span class="n">recon</span><span class="p">,</span> <span class="n">fs</span><span class="p">)</span>
+            <span class="n">target</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">pad_signal</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">fs</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mode</span> <span class="o">==</span> <span class="s2">&quot;reverse&quot;</span><span class="p">:</span>
+                <span class="n">v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">wienerfft</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">recon</span><span class="p">,</span> <span class="n">fs</span><span class="p">,</span> <span class="n">epsilon</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">mode</span> <span class="o">==</span> <span class="s2">&quot;forward&quot;</span><span class="p">:</span>
+                <span class="n">v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">wienerfft</span><span class="p">(</span><span class="n">recon</span><span class="p">,</span> <span class="n">target</span><span class="p">,</span> <span class="n">fs</span><span class="p">,</span> <span class="n">epsilon</span><span class="p">)</span>
+
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">method</span> <span class="o">==</span> <span class="s2">&quot;direct&quot;</span><span class="p">:</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mode</span> <span class="o">==</span> <span class="s2">&quot;reverse&quot;</span><span class="p">:</span>
+                <span class="n">v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">wiener</span><span class="p">(</span><span class="n">target</span><span class="p">,</span> <span class="n">recon</span><span class="p">,</span> <span class="n">fs</span><span class="p">,</span> <span class="n">epsilon</span><span class="p">)</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">mode</span> <span class="o">==</span> <span class="s2">&quot;forward&quot;</span><span class="p">:</span>
+                <span class="n">v</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">wiener</span><span class="p">(</span><span class="n">recon</span><span class="p">,</span> <span class="n">target</span><span class="p">,</span> <span class="n">fs</span><span class="p">,</span> <span class="n">epsilon</span><span class="p">)</span>
+
+        <span class="c1"># Clamp filters</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">clamp_min</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">v</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">clamp</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="nb">min</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">clamp_min</span><span class="p">)</span>
+
+        <span class="c1"># Normalise filter and store if prompted</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">store_filters</span> <span class="o">==</span> <span class="s2">&quot;unorm&quot;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">filters</span> <span class="o">=</span> <span class="n">v</span><span class="p">[:]</span>
+
+        <span class="n">vnorm</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="n">p</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dims</span><span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span><span class="p">):</span>
+            <span class="n">vnorm</span> <span class="o">=</span> <span class="n">vnorm</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="o">-</span><span class="mi">1</span><span class="p">)</span>
+        <span class="n">vnorm</span> <span class="o">=</span> <span class="n">vnorm</span><span class="o">.</span><span class="n">expand_as</span><span class="p">(</span><span class="n">v</span><span class="p">)</span>
+
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">store_filters</span> <span class="o">==</span> <span class="s2">&quot;norm&quot;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">filters</span> <span class="o">=</span> <span class="n">v</span><span class="p">[:]</span> <span class="o">/</span> <span class="n">vnorm</span>
+
+        <span class="c1"># Penalty function - recompute every iteration to recreate the computational graph</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">W</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">make_penalty</span><span class="p">(</span>
+            <span class="n">shape</span><span class="o">=</span><span class="n">fs</span><span class="p">[</span><span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span><span class="p">:],</span>
+            <span class="n">eta</span><span class="o">=</span><span class="n">eta</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">v</span><span class="o">.</span><span class="n">device</span><span class="p">,</span>
+            <span class="n">penalty_function</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">penalty_function</span>
+        <span class="p">)</span>
+        <span class="n">W</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">W</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">expand_as</span><span class="p">(</span><span class="n">v</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+
+        <span class="c1"># Delta</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">delta</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">delta</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">make_delta</span><span class="p">(</span><span class="n">shape</span><span class="o">=</span><span class="n">fs</span><span class="p">[</span><span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">filter_dim</span><span class="p">:])</span>
+        <span class="c1"># self.delta = self.make_penalty(</span>
+        <span class="c1">#     shape=fs[-self.filter_dim:],</span>
+        <span class="c1">#     eta=eta, device=v.device,</span>
+        <span class="c1">#     penalty_function=&quot;gaussian&quot;,</span>
+        <span class="c1">#     std=3e-3,</span>
+        <span class="c1"># )</span>
+        <span class="n">delta</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">delta</span><span class="o">.</span><span class="n">unsqueeze</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">.</span><span class="n">expand_as</span><span class="p">(</span><span class="n">v</span><span class="p">)</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">v</span><span class="o">.</span><span class="n">device</span><span class="p">)</span>
+        
+
+        <span class="c1"># Evaluate Loss</span>
+        <span class="n">f</span> <span class="o">=</span> <span class="mf">0.5</span> <span class="o">*</span> <span class="n">torch</span><span class="o">.</span><span class="n">norm</span><span class="p">(</span><span class="n">W</span> <span class="o">*</span> <span class="p">(</span><span class="n">v</span> <span class="o">-</span> <span class="n">delta</span><span class="p">),</span> <span class="n">p</span><span class="o">=</span><span class="mi">2</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">dims</span><span class="p">)</span>
+
+        <span class="c1"># Reduce</span>
+        <span class="c1"># f = f.sum()</span>
+        <span class="c1"># if self.reduction == &quot;mean&quot;:</span>
+        <span class="c1">#     f = f / recon.size(0)</span>
+        <span class="k">return</span> <span class="n">f</span></div>
+</div>
+
+</pre></div>
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="Main">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../../index.html">Wiener Transformer</a></h1>
+
+
+
+
+
+
+
+
+
+<search id="searchbox" style="display: none" role="search">
+    <div class="searchformwrapper">
+    <form class="search" action="../../search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" placeholder="Search"/>
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</search>
+<script>document.getElementById('searchbox').style.display = "block"</script><h3>Navigation</h3>
+<p class="caption" role="heading"><span class="caption-text">Contents:</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="../../wiener_transformer.html">Wiener Transformer</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../wiener_transformer.html#utilities">Utilities</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../wiener_attention.html">Wiener Attention</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="../../index.html">Documentation overview</a><ul>
+  <li><a href="../index.html">Module code</a><ul>
+  </ul></li>
+  </ul></li>
+</ul>
+</div>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &#169;2024, Andrei Danila.
+      
+      |
+      Powered by <a href="https://www.sphinx-doc.org/">Sphinx 8.0.2</a>
+      &amp; <a href="https://alabaster.readthedocs.io">Alabaster 1.0.0</a>
+      
+    </div>
+
+    
+
+    
+  </body>
+</html>

@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Debug train.py",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/wiener_transformer/utils/train.py",
+            "args": ["experiments/wiener_loss/awl_test/config.yaml"],
+            "console": "integratedTerminal"
+        }
+    ]
+}

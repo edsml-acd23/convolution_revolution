@@ -1,0 +1,14 @@
+batch_size: 32
+distributed: True
+num_epochs: 6
+accum_iter: 2
+base_lr: 1.0
+max_padding: 200
+warmup: 3000
+file_prefix: "glove_base"
+N: 6
+d_model: 512
+wiener_loss: False
+loss_weight: 1
+embedding_type: "glove"
+base_dir: "/scratch_brain/acd23/code/irp-acd23"

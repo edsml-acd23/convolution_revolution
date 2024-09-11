@@ -1,0 +1,16 @@
+batch_size: 32
+distributed: True
+num_epochs: 6
+accum_iter: 2
+base_lr: 1.0
+max_padding: 200
+warmup: 3000
+file_prefix: "classic_long"
+N: 6
+d_model: 512
+wiener_loss: False
+embedding_type: "learned"
+base_dir: "/scratch_brain/acd23/code/irp-acd23"
+automatic_weighted_loss: False
+from_checkpoint: True
+checkpoint_dir: "experiments/wiener_loss/classic/final_model.pt"

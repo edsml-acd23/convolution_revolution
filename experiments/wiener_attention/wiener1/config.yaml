@@ -1,0 +1,8 @@
+wiener_attention: True
+eps: 1.0E-5
+gamma: 0.1
+epochs: 10
+learning_rate: 0.001
+batch_size: 32
+max_len: 32
+dir: "wiener1"

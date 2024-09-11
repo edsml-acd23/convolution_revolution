@@ -1,0 +1,11 @@
+.DS_Store
+*.pyc
+/.data
+*.pt
+*.ipynb_checkpoints
+*.data
+*.pth
+*.egg-info
+classic_model_*
+*.pickle
+*.npy

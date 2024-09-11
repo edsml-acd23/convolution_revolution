@@ -1,0 +1,6 @@
+wiener_attention: False
+epochs: 10
+learning_rate: 0.001
+batch_size: 32
+max_len: 32
+dir: "classic"
